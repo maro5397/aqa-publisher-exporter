@@ -1,0 +1,15 @@
+[Unit]
+Description=AQA Publisher Prometheus Exporter
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/aqa-publisher-exporter --web.listen-address=:9101 --service=aqa_publisher
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
