@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"log"
 	"net/http"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,76 +39,81 @@ var (
 	})
 )
 
-// watchLogs tails the systemd journal for the service and increments counters
-// on matching log lines. It automatically restarts if journalctl exits.
-func watchLogs(service string) {
+type logPattern struct {
+	substring string
+	counter   prometheus.Counter
+}
+
+func watchLogs(ctx context.Context, service string, patterns []logPattern) {
 	for {
-		cmd := exec.Command(
-			"journalctl",
-			"-u", service,
-			"--follow",
-			"--no-pager",
-			"-n", "0", // skip historical entries; only stream new lines
+		cmd := exec.CommandContext(ctx,
+			"journalctl", "-u", service, "--follow", "--no-pager", "-n", "0",
 		)
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			log.Printf("[watchLogs] failed to create stdout pipe: %v — retrying in 5s", err)
-			time.Sleep(5 * time.Second)
-			continue
+			log.Printf("[watchLogs] stdout pipe failed: %v — retrying in 5s", err)
+			goto retry
 		}
 
 		if err := cmd.Start(); err != nil {
-			log.Printf("[watchLogs] failed to start journalctl: %v — retrying in 5s", err)
-			time.Sleep(5 * time.Second)
-			continue
+			log.Printf("[watchLogs] journalctl start failed: %v — retrying in 5s", err)
+			goto retry
 		}
 
-		log.Printf("[watchLogs] started tailing journalctl for unit=%s", service)
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.Contains(line, "Failed to submit vote for signer") {
-				voteSubmitFailedTotal.Inc()
-				log.Printf("[watchLogs] vote_submit_failed detected: %s", line)
+		log.Printf("[watchLogs] tailing unit=%s", service)
+		func() {
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				line := scanner.Text()
+				for _, p := range patterns {
+					if strings.Contains(line, p.substring) {
+						p.counter.Inc()
+					}
+				}
 			}
-			if strings.Contains(line, "All validator votes failed") {
-				allVotesFailedTotal.Inc()
-				log.Printf("[watchLogs] all_votes_failed detected: %s", line)
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			log.Printf("[watchLogs] scanner error: %v", err)
-		}
-
+		}()
 		_ = cmd.Wait()
-		log.Printf("[watchLogs] journalctl exited — retrying in 5s")
-		time.Sleep(5 * time.Second)
+
+	retry:
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 
-// pollServiceStatus periodically checks whether the systemd service is active
-// and updates the serviceUp gauge accordingly.
-func pollServiceStatus(service string) {
+func pollServiceStatus(ctx context.Context, service string) {
 	for {
 		cmd := exec.Command("systemctl", "is-active", "--quiet", service)
-		err := cmd.Run()
-		if err == nil {
+		if err := cmd.Run(); err == nil {
 			serviceUp.Set(1)
 		} else {
 			serviceUp.Set(0)
 		}
-		time.Sleep(30 * time.Second)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
 	}
 }
 
 func main() {
 	flag.Parse()
 
-	go watchLogs(*serviceName)
-	go pollServiceStatus(*serviceName)
+	patterns := []logPattern{
+		{"Failed to submit vote for signer", voteSubmitFailedTotal},
+		{"All validator votes failed", allVotesFailedTotal},
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	go watchLogs(ctx, *serviceName, patterns)
+	go pollServiceStatus(ctx, *serviceName)
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
