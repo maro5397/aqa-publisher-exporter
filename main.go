@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	listenAddr  = flag.String("web.listen-address", ":9101", "Address to listen on for HTTP requests")
+	listenAddr  = flag.String("web.listen-address", ":9100", "Address to listen on for HTTP requests")
 	serviceName = flag.String("service", "aqa_publisher", "Systemd service name to monitor")
 )
 
