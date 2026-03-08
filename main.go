@@ -109,20 +109,40 @@ func main() {
 		{"All validator votes failed", allVotesFailedTotal},
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	go watchLogs(ctx, *serviceName, patterns)
 	go pollServiceStatus(ctx, *serviceName)
 
-	http.Handle("/metrics", promhttp.Handler())
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	log.Printf("aqa-publisher-exporter listening on %s", *listenAddr)
-	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
-		log.Fatalf("HTTP server error: %v", err)
+	server := &http.Server{
+		Addr:    *listenAddr,
+		Handler: mux,
 	}
+
+	go func() {
+		log.Printf("aqa-publisher-exporter listening on %s", *listenAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("Shutting down gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Exporter exited.")
 }
